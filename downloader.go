@@ -2,8 +2,12 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
+	"io"
+	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -56,17 +60,15 @@ func ParseAria2(data []string, destination string) (files []DownloadFile) {
 	return
 }
 
-func GetInputs(inputs []string, destination string, aria2Compatibility bool) (paths []DownloadFile) {
-	for _, input := range inputs {
-		lines := ReadLines(input)
-		if aria2Compatibility {
-			paths = append(paths, ParseAria2(lines, destination)...)
-		} else {
-			for _, url := range lines {
-				if strings.HasPrefix(url, "http") {
-					urls := []string{url}
-					paths = append(paths, NewDownloadFile(urls, destination))
-				}
+func GetInput(input string, destination string, aria2Compatibility bool) (paths []DownloadFile) {
+	lines := ReadLines(input)
+	if aria2Compatibility {
+		paths = append(paths, ParseAria2(lines, destination)...)
+	} else {
+		for _, url := range lines {
+			if strings.HasPrefix(url, "http") {
+				urls := []string{url}
+				paths = append(paths, NewDownloadFile(urls, destination))
 			}
 		}
 	}
@@ -95,10 +97,53 @@ func ReadLines(filename string) (lines []string) {
 	return
 }
 
-// func Downloader(downloadFile DownloadFile, bufferSize int, quiet bool) {
-// }
+func Downloader(downloadFile DownloadFile, bufferSize int, quiet bool) {
+	// Create blank file
+	file, err := os.Create(downloadFile.Filepath())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	client := http.Client{
+		CheckRedirect: func(r *http.Request, via []*http.Request) error {
+			r.URL.Opaque = r.URL.Path
+			return nil
+		},
+	}
+	// Put content on file
+	resp, err := client.Get(downloadFile.Urls[0])
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	size, err := io.Copy(file, resp.Body)
+
+	fmt.Printf("Downloaded a file %s with size %d", downloadFile.Filename, size)
+
+}
 
 func main() {
+	var threads = flag.Int("t", 0, "thread number")
+	var quiet = flag.Bool("q", false, "quiet")
+	var destination = flag.String("d", "", "destination")
+	var aria2Compatibility = flag.Bool("a", false, "aria2 compatibility")
+	var bufferSize = flag.Int("b", BUFFER_SIZE, "buffer size")
+	var inputFile = flag.String("i", "", "input file")
+	flag.Parse()
+
+	remainingArgs := len(os.Args) - flag.NArg() - 1
+	urls := os.Args[remainingArgs:]
+
+	var downloadUrls []DownloadFile
+
+	for _, url := range urls {
+		downloadUrls = append(downloadUrls, NewDownloadFile([]string{url}, *destination))
+	}
+
+	downloadUrls = append(downloadUrls, GetInput(*inputFile, *destination, *aria2Compatibility)...)
+
 	var wg sync.WaitGroup
 	// passed &wg will be accounted at p.Wait() call
 	p := mpb.New(mpb.WithWaitGroup(&wg))
