@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -97,33 +97,6 @@ func ReadLines(filename string) (lines []string) {
 	return
 }
 
-func Downloader(downloadFile DownloadFile, bufferSize int, quiet bool) {
-	// Create blank file
-	file, err := os.Create(downloadFile.Filepath())
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer file.Close()
-
-	client := http.Client{
-		CheckRedirect: func(r *http.Request, via []*http.Request) error {
-			r.URL.Opaque = r.URL.Path
-			return nil
-		},
-	}
-	// Put content on file
-	resp, err := client.Get(downloadFile.Urls[0])
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	size, err := io.Copy(file, resp.Body)
-
-	fmt.Printf("Downloaded a file %s with size %d", downloadFile.Filename, size)
-
-}
-
 func main() {
 	var threads = flag.Int("t", 0, "thread number")
 	var quiet = flag.Bool("q", false, "quiet")
@@ -132,6 +105,8 @@ func main() {
 	var bufferSize = flag.Int("b", BUFFER_SIZE, "buffer size")
 	var inputFile = flag.String("i", "", "input file")
 	flag.Parse()
+	_ = quiet
+	_ = bufferSize
 
 	remainingArgs := len(os.Args) - flag.NArg() - 1
 	urls := os.Args[remainingArgs:]
@@ -142,47 +117,117 @@ func main() {
 		downloadUrls = append(downloadUrls, NewDownloadFile([]string{url}, *destination))
 	}
 
-	downloadUrls = append(downloadUrls, GetInput(*inputFile, *destination, *aria2Compatibility)...)
+	if *inputFile != "" {
+		downloadUrls = append(downloadUrls, GetInput(*inputFile, *destination, *aria2Compatibility)...)
+	}
+
+	if *threads <= 0 {
+		*threads = runtime.NumCPU()
+	}
 
 	var wg sync.WaitGroup
 	// passed &wg will be accounted at p.Wait() call
 	p := mpb.New(mpb.WithWaitGroup(&wg))
-	total, numBars := 100, 3
-	wg.Add(numBars)
+	wg.Add(*threads)
 
-	for i := 0; i < numBars; i++ {
-		name := fmt.Sprintf("Bar#%d:", i)
-		bar := p.AddBar(int64(total),
-			mpb.PrependDecorators(
-				// simple name decorator
-				decor.Name(name),
-				// decor.DSyncWidth bit enables column width synchronization
-				decor.Percentage(decor.WCSyncSpace),
-			),
-			mpb.AppendDecorators(
-				// replace ETA decorator with "done" message, OnComplete event
-				decor.OnComplete(
-					// ETA decorator with ewma age of 60
-					decor.EwmaETA(decor.ET_STYLE_GO, 60, decor.WCSyncWidth), "done",
-				),
-			),
-		)
-		// simulating some work
-		go func() {
-			defer wg.Done()
-			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-			max := 100 * time.Millisecond
-			for i := 0; i < total; i++ {
-				// start variable is solely for EWMA calculation
-				// EWMA's unit of measure is an iteration's duration
-				start := time.Now()
-				time.Sleep(time.Duration(rng.Intn(10)+1) * max / 10)
-				bar.Increment()
-				// we need to call DecoratorEwmaUpdate to fulfill ewma decorator's contract
-				bar.DecoratorEwmaUpdate(time.Since(start))
-			}
-		}()
+	jobs := make(chan DownloadFile, len(downloadUrls))
+
+	for w := 0; w < *threads; w++ {
+		go DownloaderWorker(w, jobs, &wg, p, *bufferSize, *quiet)
 	}
-	// Waiting for passed &wg and for all bars to complete and flush
+
+	for _, url := range downloadUrls {
+		jobs <- url
+	}
+
+	close(jobs)
+
+	// for th := 0; th < *threads; th++ {
+	// 	name := fmt.Sprintf("Bar#%d:", th)
+	// 	bar := p.AddBar(int64(total),
+	// 		mpb.PrependDecorators(
+	// 			// simple name decorator
+	// 			decor.Name(name),
+	// 			// decor.DSyncWidth bit enables column width synchronization
+	// 			decor.Percentage(decor.WCSyncSpace),
+	// 		),
+	// 		mpb.AppendDecorators(
+	// 			// replace ETA decorator with "done" message, OnComplete event
+	// 			decor.OnComplete(
+	// 				// ETA decorator with ewma age of 60
+	// 				decor.EwmaETA(decor.ET_STYLE_GO, 60, decor.WCSyncWidth), "done",
+	// 			),
+	// 		),
+	// 	)
+	// 	// simulating some work
+	// 	go func() {
+	// 		defer wg.Done()
+	// 		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	// 		max := 100 * time.Millisecond
+	// 		for i := 0; i < total; i++ {
+	// 			// start variable is solely for EWMA calculation
+	// 			// EWMA's unit of measure is an iteration's duration
+	// 			start := time.Now()
+	// 			time.Sleep(time.Duration(rng.Intn(10)+1) * max / 10)
+	// 			bar.Increment()
+	// 			// we need to call DecoratorEwmaUpdate to fulfill ewma decorator's contract
+	// 			bar.DecoratorEwmaUpdate(time.Since(start))
+	// 		}
+	// 	}()
+	// }
+	// // Waiting for passed &wg and for all bars to complete and flush
+	// p.Wait()
+
 	p.Wait()
+}
+
+func DownloaderWorker(id int, jobs <-chan DownloadFile, wg *sync.WaitGroup, p *mpb.Progress, bufferSize int, quiet bool) {
+	name := fmt.Sprintf("Bar#%d:", id)
+	bar := p.AddBar(int64(100),
+		mpb.PrependDecorators(
+			// simple name decorator
+			decor.Name(name),
+			// decor.DSyncWidth bit enables column width synchronization
+			decor.Percentage(decor.WCSyncSpace),
+		),
+		mpb.AppendDecorators(
+			// replace ETA decorator with "done" message, OnComplete event
+			decor.OnComplete(
+				// ETA decorator with ewma age of 60
+				decor.EwmaETA(decor.ET_STYLE_GO, 60, decor.WCSyncWidth), "done",
+			),
+		),
+	)
+
+	for job := range jobs {
+		start := time.Now()
+		// Create blank file
+		file, err := os.Create(job.Filepath())
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		client := http.Client{
+			CheckRedirect: func(r *http.Request, via []*http.Request) error {
+				r.URL.Opaque = r.URL.Path
+				return nil
+			},
+		}
+		// Put content on file
+		resp, err := client.Get(job.Urls[0])
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		size, _ := io.Copy(file, resp.Body)
+
+		fmt.Printf("Downloaded a file %s with size %d", job.Filename, size)
+		bar.Increment()
+		// we need to call DecoratorEwmaUpdate to fulfill ewma decorator's contract
+		bar.DecoratorEwmaUpdate(time.Since(start))
+
+		resp.Body.Close()
+		file.Close()
+		wg.Done()
+	}
 }
